@@ -11,11 +11,9 @@ from Data import disorders, disorders_and_DSM5Symptoms, probabilities_calculatio
     symptom_index_number
 
 # this reads your .env file and sets environment variables
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    raise Exception("OPENAI_API_KEY environment variable not found")
+openai.api_key = ###client = openai
 
-client = OpenAI(api_key=api_key)
+client = OpenAI(api_key=openai.api_key)
 
 
 # Functions in functions that make up the logic
