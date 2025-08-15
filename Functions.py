@@ -1,3 +1,5 @@
+from typing import Tuple, Dict, Any, List
+from Data import disorders, symptom_index_number
 from dotenv import load_dotenv
 import os
 
@@ -10,8 +12,8 @@ from openai import OpenAI
 from Data import disorders, disorders_and_DSM5Symptoms, probabilities_calculation_list, response_identifier_list, \
     symptom_index_number
 
+
 # this reads your .env file and sets environment variables
-openai.api_key = ###client = openai
 
 client = OpenAI(api_key=openai.api_key)
 
@@ -330,6 +332,299 @@ def Get_General_info(highest_probability_disorder):
     for disorder in disorders:
         if highest_probability_disorder.strip().lower() == disorder["name"].strip().lower():
             return disorder["General Info"]
+
+
+def _dsm_for(disorder_name)-> List[str]:
+    for d in disorders:
+        if d["name"].strip().lower() == disorder_name.strip().lower():
+            return d["DSM-5 Symptoms"]
+    return []
+
+def _numbered(lines)->str:
+    return "\n".join(f"{i}. {s}" for i, s in enumerate(lines, start=1))
+
+def _set_symptom_indices_to_all_for(disorder_name)-> None:
+    symptom_index_number.clear()
+    n = len(_dsm_for(disorder_name))
+    symptom_index_number.extend(list(range(1, n + 1)))
+
+
+def _parse_numbers(text) -> List[int]:
+    out = []
+    for tok in (text or "").replace(",", " ").split():
+        if tok.isdigit():
+            out.append(int(tok))
+    return out
+
+def check_all_disorders_ui(description) -> Tuple[str, Dict[str, Any]]:
+    from Data import response_identifier_list, probabilities_calculation_list  # reuse globals your code uses
+
+    desc = (description or "").strip().lower()
+    if not desc:
+        return "Please describe your symptoms in a sentence or two.", {}
+
+    # fresh run
+    response_identifier_list.clear()
+    probabilities_calculation_list.clear()
+
+    # Collect (name, score, explanation) using your existing Detect_with_GPT
+    triples: List[Tuple[str, int, str]] = []
+    for d in disorders:
+        name = d["name"]
+        _set_symptom_indices_to_all_for(name)  # make List_DSM_Symptoms() include ALL for this scoring pass
+        r1, r2 = Detect_with_GPT(desc, name)
+        try:
+            if str(r1).strip().lower() == "bogus":
+                continue
+            score = int(str(r1).strip())
+            triples.append((name, score, r2))
+        except Exception:
+            # ignore non-integer ratings
+            continue
+
+    # Reset symptom selection after scoring
+    symptom_index_number.clear()
+
+    if not triples:
+        return (
+            "I couldn't map your text to any disorder right now.\n"
+            "Try a bit more detail (e.g., duration, impact on sleep/appetite, triggers).",
+            {}
+        )
+
+    # Pick top-2
+    triples.sort(key=lambda t: t[1], reverse=True)
+    top1 = triples[0]
+    top2 = triples[1] if len(triples) > 1 else None
+
+    highest = top1[0]
+    second = top2[0] if top2 else None
+    responseOne = top1[1]  # numeric score
+    responseTwo = top1[2]  # explanation from Detect_with_GPT
+    general_info = Get_General_info(highest)
+
+    # Prepare numbered DSM for user to pick from
+    dsm_numbered = _numbered(_dsm_for(highest))
+
+    # Minimal chat state we’ll keep between turns
+    state: Dict[str, Any] = {
+        "stage": "awaiting_dsm_numbers",
+        "description": desc,
+        "highest": highest,
+        "second": second,
+        "responseOne": responseOne,
+        "responseTwo": responseTwo,
+        "general_info": general_info,
+    }
+
+    summary = (
+        f"Most likely: {highest} (score: {responseOne})\n"
+        f"Second most likely: {second or '—'}\n\n"
+        f"DSM-5 symptoms for {highest} (enter the numbers you have, e.g. '1 3 5'):\n{dsm_numbered}"
+    )
+    return summary, state
+
+
+def generate_advice_chat(user_numbers_text, state) -> str:
+    if not state:
+        return "Session expired. Say 'restart' to begin a new check."
+
+        # parse and apply chosen DSM indices to your existing global
+    symptom_index_number.clear()
+    symptom_index_number.extend(_parse_numbers(user_numbers_text))
+
+    # Build DSM lists for the chosen disorders using original utilities
+    dsm_selected = List_DSM_Symptoms(state["highest"])
+    second_dsm = _numbered(_dsm_for(state["second"])) if state.get("second") else ""
+
+    advice = chat_with_gpt(
+        prompt=state["description"],
+        DSM_list=dsm_selected,
+        General_Info=state["general_info"],
+        highest_probability_disorder=state["highest"],
+        second_most_likely_disorder=state.get("second"),
+        DSM_list_second_most_likely_disorder=second_dsm,
+        responseOne=state["responseOne"],
+        responseTwo=state["responseTwo"],
+        description=state["description"],
+    )
+    return advice
+
+from typing import Any, Dict, Tuple, List
+
+def chat_router(user_text: str, state: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    raw = (user_text or "").strip()
+    msg = raw.lower()
+
+    # Restart handling
+    if not state or msg in {"restart", "/restart", "start over", "reset"}:
+        return (
+            "Welcome to Cerebot.\n"
+            "Please describe your symptoms (e.g., mood, sleep, appetite, thoughts, duration).",
+            {"stage": "awaiting_description"}
+        )
+
+    stage = state.get("stage", "awaiting_description")
+
+    # ========== Stage 1: user describing symptoms ==========
+    if stage == "awaiting_description":
+        # Your function should compute probabilities, set state keys like:
+        #  - 'highest' (str), 'second' (str or None), 'general_info', 'description'
+        # Optionally: 'candidate_queue' (List[str]) if you have more than two disorders.
+        summary, new_state = check_all_disorders_ui(raw)
+
+        if new_state:
+            # reset symptom collection for the DSM step
+            new_state["selected_symptoms"] = []
+            return (
+                summary + "\n\nDo you have any of these symptoms? (yes/no)",
+                {**new_state, "stage": "awaiting_dsm_yesno"}
+            )
+        else:
+            return (summary, {"stage": "awaiting_description"})
+
+    # ========== Stage 2a: yes/no before selecting DSM numbers ==========
+    if stage == "awaiting_dsm_yesno":
+        if msg == "yes":
+            dsm_numbered = _numbered(_dsm_for(state.get("highest", "")))
+            # make sure we have a collector
+            state["selected_symptoms"] = []
+            return (
+                "Okay. Please type the symptom numbers one at a time (e.g., `1`). "
+                "You can also paste multiple at once (e.g., `1 3 5`). "
+                "When finished, type `done`.\n\n"
+                f"DSM-5 symptoms for {state.get('highest', '')}:\n{dsm_numbered}",
+                {**state, "stage": "awaiting_dsm_numbers"}
+            )
+
+        if msg in {"no", "none"}:
+            # Prefer a queue if you already supply it; otherwise fallback to 'second'
+            queue: List[str] = state.get("candidate_queue") or []
+            current = state.get("highest")
+
+            # Remove current from queue if present
+            if queue and current in queue:
+                queue = [d for d in queue if d != current]
+
+            next_disorder = None
+            if queue:
+                next_disorder = queue.pop(0)
+                state["candidate_queue"] = queue
+            elif state.get("second"):
+                next_disorder = state["second"]
+                state["second"] = None
+
+            if next_disorder:
+                state["highest"] = next_disorder
+                state["responseOne"] = 0
+                state["responseTwo"] = ""
+                state["general_info"] = Get_General_info(next_disorder)
+                state["selected_symptoms"] = []
+
+                dsm_numbered = _numbered(_dsm_for(next_disorder))
+                return (
+                    f"Okay, let's check the next most likely disorder: {next_disorder}.\n\n"
+                    f"Do you have any of these DSM-5 symptoms? (yes/no)\n\n"
+                    f"{dsm_numbered}",
+                    {**state, "stage": "awaiting_dsm_yesno"}
+                )
+
+            # No more candidates
+            return (
+                "None of the disorders matched your symptoms.\n"
+                "Please try describing your symptoms again with more detail, or type 'restart' to start over.",
+                {"stage": "awaiting_description"}
+            )
+
+        # not yes/no
+        return ("Please answer 'yes' or 'no'.", state)
+
+    # ========== Stage 2b: entering DSM numbers (one-by-one or many) ==========
+    if stage == "awaiting_dsm_numbers":
+        # finish selection
+        if msg == "done":
+            selected = state.get("selected_symptoms", [])
+            if not selected:
+                # If they typed done without any selections, ask again.
+                dsm_numbered = _numbered(_dsm_for(state.get("highest", "")))
+                return (
+                    "You haven't entered any symptom numbers yet. "
+                    "Please enter at least one number, or type 'no' at the previous step if none apply.\n\n"
+                    f"DSM-5 symptoms for {state.get('highest','')}:\n{dsm_numbered}",
+                    state
+                )
+
+            # Build the string that your existing parser expects (e.g., "1 3 5")
+            numbers_str = " ".join(str(n) for n in selected)
+
+            # This uses your existing logic to compute advice and set any state side-effects your code expects
+            advice = generate_advice_chat(numbers_str, state)
+
+            return (
+                advice + "\n\nYou can ask follow-up questions, or type 'restart' to begin again.",
+                {**state, "stage": "chat_followup"}
+            )
+
+        # allow multiple numbers in one message or single number
+        tokens = [t for t in raw.replace(",", " ").split() if t.isdigit()]
+        if tokens:
+            all_symptoms = _dsm_for(state.get("highest", ""))
+            max_idx = len(all_symptoms) if all_symptoms else 0
+            selected = state.get("selected_symptoms", [])
+            added = []
+
+            for t in tokens:
+                n = int(t)
+                if 1 <= n <= max_idx and n not in selected:
+                    selected.append(n)
+                    added.append(n)
+
+            state["selected_symptoms"] = selected
+
+            if added:
+                added_text = ", ".join(str(n) for n in added)
+                chosen_text = ", ".join(str(n) for n in selected)
+                details = "\n".join(
+                    f"{i}. {all_symptoms[i-1]}" for i in added
+                )
+                return (
+                    f"Recorded symptom(s): {added_text}\n{details}\n\n"
+                    f"Current selection: {chosen_text}\n"
+                    "Enter another number, paste more numbers, or type 'done' when finished.",
+                    state
+                )
+            else:
+                return (
+                    f"No new valid numbers found. Please choose between 1 and {max_idx}, or type 'done'.",
+                    state
+                )
+
+        # if it wasn't numbers or 'done'
+        return ("Please enter symptom numbers (e.g., `1` or `1 3 5`), or type `done`.", state)
+
+    # ========== Stage 3: follow-up chatbot ==========
+    if stage == "chat_followup":
+        # IMPORTANT: use the original casing (raw) for the chat prompt
+        follow = chat_with_gpt(
+            prompt=raw,
+            DSM_list=List_DSM_Symptoms(state.get("highest", "")),
+            General_Info=state.get("general_info", ""),
+            highest_probability_disorder=state.get("highest", ""),
+            second_most_likely_disorder=state.get("second"),
+            DSM_list_second_most_likely_disorder=_numbered(_dsm_for(state.get("second"))) if state.get("second") else "",
+            responseOne=state.get("responseOne", 0),
+            responseTwo=state.get("responseTwo", ""),
+            description=state.get("description", "")
+        )
+        return follow, state
+
+    # Fallback
+    return "Say 'restart' to start again.", {"stage": "awaiting_description"}
+
+
+
+
+
 
 
 
